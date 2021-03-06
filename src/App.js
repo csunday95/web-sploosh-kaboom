@@ -9,7 +9,8 @@ import init, {
 } from './wasm/sploosh_wasm.js';
 const interpolate = require('color-interpolate');
 
-const VERSION_STRING = 'v0.0.20';
+const VERSION_STRING = 'v0.0.21';
+const TOTAL_SQUID_TILES = 2 + 3 + 4;
 
 var globalDB = null;
 const indexedDBreq = window.indexedDB.open('splooshkaboom', 1);
@@ -750,7 +751,6 @@ class MainMap extends React.Component {
         dbCachedFetch(tableName, (buf) => {
             this.boardTable = new Uint32Array(buf);
             // Warning: Do I need to await wasm here first?
-            console.log('Board table length:', this.boardTable.length);
             // Make sure every value is in range.
             for (const v of this.boardTable)
                 if (v > 604583)
@@ -790,8 +790,16 @@ class MainMap extends React.Component {
 
     makeGameHistoryArguments() {
         // Figure out how many history boards we have.
-        const rawObservedBoards = this.layoutDrawingBoardRefs
-            .map((ref) => this.boardIndices[ref.current.getLayoutString()]);
+        const rawObservedBoards = this.layoutDrawingBoardRefs.map(
+            (ref) => {
+                if(ref !== null && ref.current){
+                    return this.boardIndices[ref.current.getLayoutString()];
+                }
+                else {
+                    return undefined;
+                }
+            }
+        );
         const observedBoards = [];
         for (const ob of rawObservedBoards) {
             if (ob === undefined)
@@ -851,7 +859,6 @@ class MainMap extends React.Component {
     }
 
     async doComputation(grid, squidsGotten) {
-        console.log('Doing computation:', squidsGotten, grid);
         const t0 = performance.now();
         const {hits, misses, numericSquidsGotten} = this.getGridStatistics(grid, squidsGotten);
 
@@ -860,7 +867,6 @@ class MainMap extends React.Component {
         let gameHistoryArguments = null;
         if (this.state.turboBlurboMode) {
             gameHistoryArguments = this.makeGameHistoryArguments();
-            console.log('gameHistoryArguments:', gameHistoryArguments);
 
             probabilities = calculate_probabilities_from_game_history(
                 Uint8Array.from(hits),
@@ -885,13 +891,19 @@ class MainMap extends React.Component {
             let maxX = 0;
             let highestProb = -1;
             let probs = [];
+            let certainKillProbabilities = null;
+            let certaintyCount = 0;
 
             // Here we implement our L1 distance bonus heuristic.
             // The idea is that we want to highlight a square that isn't too far from where
             // the player last adjusted the board. (i.e. where we believe their cursor is.)
             for (let y = 0; y < 8; y++) {
                 for (let x = 0; x < 8; x++) {
-                    probs[[x, y]] = probabilities[8 * y + x];
+                    let currentProbability = probabilities[8 * y + x];
+                    probs[[x, y]] = currentProbability;
+                    if (currentProbability === 1.0) {
+                        certaintyCount++;
+                    }
                     const l1Distance = computeL1Distance(this.state.cursorBelief, [x, y]);
                     const distancePenaltyMultiplier = 1 - 0.03 * l1Distance;
                     const distanceAdjustedProb = probabilities[8 * y + x] * distancePenaltyMultiplier;
@@ -902,8 +914,11 @@ class MainMap extends React.Component {
                     }
                 }
             }
+            if (certaintyCount === TOTAL_SQUID_TILES) {
+                certainKillProbabilities = probabilities;
+            }
             const observationProb = probabilities[64];
-            this.setState({ probs, best: highestProb >= 0 ? [maxX, maxY] : null, valid, observationProb });
+            this.setState({ probs, best: highestProb >= 0 ? [maxX, maxY] : null, valid, observationProb, certainKillProbabilities });
         } else {
             valid = false;
             this.setState({ valid });
@@ -916,7 +931,7 @@ class MainMap extends React.Component {
             grid, hits, misses, numericSquidsGotten,
             oldValid: this.state.valid,
             didWeConcludeTheSituationWasValid: valid,
-            probabilities: Array.from(probabilities),
+            probabilities: probabilities ? Array.from(probabilities) : [],
             turboBlurboMode: this.state.turboBlurboMode,
             turboBlurboTiming: this.state.turboBlurboTiming,
             gameHistoryArguments: (gameHistoryArguments === null) ? [] : gameHistoryArguments.map(a => Array.from(a)),
@@ -1019,11 +1034,29 @@ class MainMap extends React.Component {
         if (this.state.best !== null && this.state.grid[this.state.best] === null) {
             sendSpywareEvent({kind: 'reportHit', best: this.state.best, oldGrid: this.state.grid});
             this.onClick(...this.state.best, true);
-            const {hits, misses, numericSquidsGotten} = this.getGridStatistics(this.state.grid, this.state.squidsGotten);
-            if (hits.length === 9) {
+            const {hits} = this.getGridStatistics(this.state.grid, this.state.squidsGotten);
+            if (hits.length === TOTAL_SQUID_TILES) {
+                this.state.squidsGotten = 3;
                 this.incrementKills();
             }
         }
+    }
+
+    reportFinalKill() {
+        if (!this.state.certainKillProbabilities) {
+            console.log('no certainty');
+            return;
+        }
+        for (let y = 0; y < 8; y++) {
+            for (let x = 0; x < 8; x++) {
+                let currentProbability = this.state.certainKillProbabilities[8 * y + x];
+                if (currentProbability === 1.0) {
+                    this.state.grid[[x, y]] = "HIT";
+                }
+            }
+        }
+        this.state.squidsGotten = 3;
+        this.incrementKills();
     }
 
     splitTimer() {
@@ -1033,7 +1066,7 @@ class MainMap extends React.Component {
         const elapsed = boardTimer.getSecondsElapsed();
         const timerStepEstimate = boardTimer.state.invalidated ? null : boardTimer.guessStepsElapsedFromTime(elapsed);
         this.setState({timerStepEstimate});
-        console.log('Timer step estimate:', timerStepEstimate);
+        console.log(['Timer step estimate: ', timerStepEstimate, " | time: ", elapsed]);
         sendSpywareEvent({kind: 'splitTimer', invalidated: boardTimer.state.invalidated, timerStepEstimate: timerStepEstimate, elapsed});
         boardTimer.setState({
             previouslyAccumulatedSeconds: 0.0,
@@ -1061,7 +1094,7 @@ class MainMap extends React.Component {
                 numericValue = 0;
                 grid = this.makeEmptyGrid();
                 // FIXME: Make us able to undo across completions.
-                this.setState({undoBuffer: [], cursorBelief: [3, 3]});
+                this.setState({undoBuffer: [], cursorBelief: [3, 3], certainKillProbabilities: null});
             } else {
                 numericValue = 3;
             }
@@ -1349,6 +1382,8 @@ function globalShortcutsHandler(evt) {
         globalMap.reportMiss();
     if ((event_key === 'x') && globalMap !== null)
         globalMap.reportHit();
+    if ((event_key === 'k') && globalMap !== null)
+        globalMap.reportFinalKill();
     if (event_key === 'c' && globalMap !== null)
         globalMap.incrementKills();
     if (event_key === 's' && globalMap !== null)
